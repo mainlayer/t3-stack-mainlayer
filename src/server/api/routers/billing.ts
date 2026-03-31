@@ -5,7 +5,7 @@ import { mainlayer, type Plan } from "~/lib/mainlayer";
 
 // ---------------------------------------------------------------------------
 // Hardcoded plan definitions — replace resource_id values with your real
-// Mainlayer resource IDs from https://app.mainlayer.xyz
+// Mainlayer resource IDs from https://app.mainlayer.fr
 // ---------------------------------------------------------------------------
 const PLANS: Plan[] = [
   {

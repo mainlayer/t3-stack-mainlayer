@@ -1,11 +1,11 @@
 /**
  * Mainlayer client — billing and subscription management for AI-powered SaaS.
- * Base URL: https://api.mainlayer.xyz
- * Docs: https://docs.mainlayer.xyz
+ * Base URL: https://api.mainlayer.fr
+ * Docs: https://docs.mainlayer.fr
  */
 
 const MAINLAYER_API_URL =
-  process.env.MAINLAYER_API_URL ?? "https://api.mainlayer.xyz";
+  process.env.MAINLAYER_API_URL ?? "https://api.mainlayer.fr";
 
 function getApiKey(): string {
   const key = process.env.MAINLAYER_API_KEY;
