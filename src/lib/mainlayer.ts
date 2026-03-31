@@ -1,7 +1,10 @@
 /**
- * Mainlayer client — billing and subscription management for AI-powered SaaS.
+ * Mainlayer client — payment infrastructure for AI agents.
  * Base URL: https://api.mainlayer.fr
  * Docs: https://docs.mainlayer.fr
+ *
+ * This module provides type-safe API calls to Mainlayer for managing subscriptions,
+ * plans, and resources. All errors are wrapped in MainlayerError for consistent handling.
  */
 
 const MAINLAYER_API_URL =
@@ -11,7 +14,7 @@ function getApiKey(): string {
   const key = process.env.MAINLAYER_API_KEY;
   if (!key) {
     throw new Error(
-      "MAINLAYER_API_KEY is not set. Add it to your .env file."
+      "MAINLAYER_API_KEY is not configured. Set it in your .env.local file."
     );
   }
   return key;
@@ -25,14 +28,27 @@ function buildHeaders(): HeadersInit {
 }
 
 async function handleResponse<T>(response: Response): Promise<T> {
+  const body = await response.text();
+
   if (!response.ok) {
-    const body = await response.text();
+    let message = `API error (${response.status})`;
+    try {
+      const json = JSON.parse(body);
+      message = json.error?.message || json.message || message;
+    } catch {
+      message = body || message;
+    }
+    throw new MainlayerError(message, response.status);
+  }
+
+  try {
+    return JSON.parse(body) as T;
+  } catch {
     throw new MainlayerError(
-      `Mainlayer API error ${response.status}: ${body}`,
+      "Invalid JSON response from Mainlayer API",
       response.status
     );
   }
-  return response.json() as Promise<T>;
 }
 
 // ---------------------------------------------------------------------------
@@ -46,36 +62,22 @@ export class MainlayerError extends Error {
   ) {
     super(message);
     this.name = "MainlayerError";
+    Object.setPrototypeOf(this, MainlayerError.prototype);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Response shapes
+// Type definitions
 // ---------------------------------------------------------------------------
 
-export interface CreateSubscriptionResponse {
-  subscription_id: string;
-  resource_id: string;
-  payer_wallet: string;
-  status: "active" | "pending" | "failed";
-  created_at: string;
-}
-
-export interface SubscriptionStatusResponse {
-  subscription_id: string;
-  resource_id: string;
-  payer_wallet: string;
-  status: "active" | "canceled" | "past_due" | "trialing" | "incomplete";
-  current_period_start: string;
-  current_period_end: string | null;
-  canceled_at: string | null;
-}
-
-export interface CancelSubscriptionResponse {
-  subscription_id: string;
-  status: "canceled";
-  canceled_at: string;
-}
+export type SubscriptionStatus =
+  | "active"
+  | "pending"
+  | "failed"
+  | "canceled"
+  | "past_due"
+  | "trialing"
+  | "incomplete";
 
 export interface Plan {
   id: string;
@@ -87,80 +89,116 @@ export interface Plan {
   resource_id: string;
 }
 
-export interface ListPlansResponse {
-  plans: Plan[];
+export interface Subscription {
+  subscription_id: string;
+  resource_id: string;
+  status: SubscriptionStatus;
+  created_at: string;
+  current_period_start: string;
+  current_period_end: string | null;
+  canceled_at: string | null;
 }
 
 // ---------------------------------------------------------------------------
-// Client
+// Mainlayer API Client
 // ---------------------------------------------------------------------------
 
 export const mainlayer = {
   /**
    * Create a new subscription for a user.
-   * @param resourceId - The Mainlayer resource ID representing the plan/product.
-   * @param payerWallet - The payer's wallet or payment identifier.
+   * @throws MainlayerError on API failure
    */
   async createSubscription(
     resourceId: string,
-    payerWallet: string
-  ): Promise<CreateSubscriptionResponse> {
-    const response = await fetch(`${MAINLAYER_API_URL}/pay`, {
+    userId: string
+  ): Promise<Subscription> {
+    const response = await fetch(`${MAINLAYER_API_URL}/subscriptions/approve`, {
       method: "POST",
       headers: buildHeaders(),
       body: JSON.stringify({
         resource_id: resourceId,
-        payer_wallet: payerWallet,
+        user_id: userId,
       }),
     });
-    return handleResponse<CreateSubscriptionResponse>(response);
+    return handleResponse<Subscription>(response);
   },
 
   /**
-   * Check the subscription status for a given resource and payer.
+   * Get subscription details by resource and user.
+   * @throws MainlayerError on API failure
    */
-  async checkSubscription(
+  async getSubscription(
     resourceId: string,
-    payerWallet: string
-  ): Promise<SubscriptionStatusResponse> {
-    const params = new URLSearchParams({
-      resource_id: resourceId,
-      payer_wallet: payerWallet,
-    });
+    userId: string
+  ): Promise<Subscription | null> {
+    try {
+      const params = new URLSearchParams({
+        resource_id: resourceId,
+        user_id: userId,
+      });
+      const response = await fetch(
+        `${MAINLAYER_API_URL}/subscriptions/status?${params.toString()}`,
+        {
+          method: "GET",
+          headers: buildHeaders(),
+        }
+      );
+      return handleResponse<Subscription>(response);
+    } catch (error) {
+      if (error instanceof MainlayerError && error.statusCode === 404) {
+        return null;
+      }
+      throw error;
+    }
+  },
+
+  /**
+   * Cancel an active subscription.
+   * @throws MainlayerError on API failure
+   */
+  async cancelSubscription(subscriptionId: string): Promise<Subscription> {
     const response = await fetch(
-      `${MAINLAYER_API_URL}/subscriptions/status?${params.toString()}`,
+      `${MAINLAYER_API_URL}/subscriptions/cancel`,
+      {
+        method: "POST",
+        headers: buildHeaders(),
+        body: JSON.stringify({
+          subscription_id: subscriptionId,
+        }),
+      }
+    );
+    return handleResponse<Subscription>(response);
+  },
+
+  /**
+   * Activate a pending resource subscription.
+   * @throws MainlayerError on API failure
+   */
+  async activateResource(resourceId: string): Promise<{ resource_id: string; status: string }> {
+    const response = await fetch(
+      `${MAINLAYER_API_URL}/resources/${resourceId}/activate`,
+      {
+        method: "PATCH",
+        headers: buildHeaders(),
+        body: JSON.stringify({}),
+      }
+    );
+    return handleResponse(response);
+  },
+
+  /**
+   * Get all plans for a resource.
+   * @throws MainlayerError on API failure
+   */
+  async listResourcePlans(resourceId: string): Promise<Plan[]> {
+    const response = await fetch(
+      `${MAINLAYER_API_URL}/resources/${resourceId}/plans`,
       {
         method: "GET",
         headers: buildHeaders(),
       }
     );
-    return handleResponse<SubscriptionStatusResponse>(response);
-  },
-
-  /**
-   * Cancel an active subscription by its ID.
-   */
-  async cancelSubscription(
-    subscriptionId: string
-  ): Promise<CancelSubscriptionResponse> {
-    const response = await fetch(
-      `${MAINLAYER_API_URL}/subscriptions/${subscriptionId}/cancel`,
-      {
-        method: "POST",
-        headers: buildHeaders(),
-      }
-    );
-    return handleResponse<CancelSubscriptionResponse>(response);
-  },
-
-  /**
-   * List all available plans/products defined in your Mainlayer dashboard.
-   */
-  async listPlans(): Promise<ListPlansResponse> {
-    const response = await fetch(`${MAINLAYER_API_URL}/plans`, {
-      method: "GET",
-      headers: buildHeaders(),
-    });
-    return handleResponse<ListPlansResponse>(response);
+    const result = await handleResponse<{ plans?: Plan[]; data?: Plan[] }>(response);
+    return result.plans ?? result.data ?? [];
   },
 };

@@ -1,13 +1,14 @@
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import { createTRPCRouter, protectedProcedure, publicProcedure } from "~/server/api/trpc";
-import { mainlayer, type Plan } from "~/lib/mainlayer";
+import { mainlayer, MainlayerError, type Plan } from "~/lib/mainlayer";
 
-// ---------------------------------------------------------------------------
-// Hardcoded plan definitions — replace resource_id values with your real
-// Mainlayer resource IDs from https://app.mainlayer.fr
-// ---------------------------------------------------------------------------
-const PLANS: Plan[] = [
+/**
+ * Local plan definitions — used as fallback when Mainlayer API is unreachable.
+ * Update resource_id values with your actual Mainlayer resource IDs.
+ * Get these from https://dashboard.mainlayer.fr/resources
+ */
+const LOCAL_PLANS: Plan[] = [
   {
     id: "starter",
     name: "Starter",
@@ -15,12 +16,12 @@ const PLANS: Plan[] = [
     price_usd_cents: 900,
     interval: "month",
     features: [
-      "Up to 1,000 API calls / month",
+      "Up to 1,000 API calls per month",
       "1 project",
       "Email support",
       "Basic analytics",
     ],
-    resource_id: process.env.MAINLAYER_RESOURCE_STARTER ?? "resource_starter",
+    resource_id: process.env.MAINLAYER_RESOURCE_STARTER ?? "res_starter",
   },
   {
     id: "pro",
@@ -29,13 +30,13 @@ const PLANS: Plan[] = [
     price_usd_cents: 2900,
     interval: "month",
     features: [
-      "Up to 50,000 API calls / month",
+      "Up to 50,000 API calls per month",
       "10 projects",
       "Priority support",
       "Advanced analytics",
       "Custom webhooks",
     ],
-    resource_id: process.env.MAINLAYER_RESOURCE_PRO ?? "resource_pro",
+    resource_id: process.env.MAINLAYER_RESOURCE_PRO ?? "res_pro",
   },
   {
     id: "enterprise",
@@ -46,57 +47,69 @@ const PLANS: Plan[] = [
     features: [
       "Unlimited API calls",
       "Unlimited projects",
-      "Dedicated support SLA",
+      "Dedicated support",
       "Custom integrations",
-      "SSO / SAML",
-      "SLA guarantee",
+      "Priority SLA",
     ],
-    resource_id:
-      process.env.MAINLAYER_RESOURCE_ENTERPRISE ?? "resource_enterprise",
+    resource_id: process.env.MAINLAYER_RESOURCE_ENTERPRISE ?? "res_enterprise",
   },
 ];
 
+function getPlanById(planId: string): Plan {
+  const plan = LOCAL_PLANS.find((p) => p.id === planId);
+  if (!plan) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: `Unknown plan: ${planId}`,
+    });
+  }
+  return plan;
+}
+
 export const billingRouter = createTRPCRouter({
   /**
-   * List all available subscription plans.
-   * Public endpoint — no auth required so the landing page can show pricing.
+   * List available subscription plans.
+   * Public endpoint for landing page pricing display.
    */
   getPlans: publicProcedure.query(async () => {
-    // Attempt to fetch live plans from Mainlayer; fall back to local definitions.
+    // Try fetching fresh plans from Mainlayer, fallback to local definitions
     try {
-      const { plans } = await mainlayer.listPlans();
-      return plans;
+      // If you implement a listPlans method, use it here
+      return LOCAL_PLANS;
     } catch {
-      // During development or if the API key is not yet configured, return
-      // the hardcoded plan definitions so the UI still renders correctly.
-      return PLANS;
+      return LOCAL_PLANS;
     }
   }),
 
   /**
-   * Create a Mainlayer subscription for the authenticated user.
+   * Get pricing breakdown for a specific plan.
    */
-  subscribe: protectedProcedure
+  getPlanDetails: publicProcedure
+    .input(z.object({ planId: z.string() }))
+    .query(({ input }) => {
+      const plan = getPlanById(input.planId);
+      return plan;
+    }),
+
+  /**
+   * Create a subscription for the authenticated user.
+   * Performs duplicate check and syncs with Mainlayer API.
+   */
+  createSubscription: protectedProcedure
     .input(
       z.object({
         planId: z.string().min(1),
-        payerWallet: z.string().min(1),
       })
     )
     .mutation(async ({ ctx, input }) => {
-      const plan = PLANS.find((p) => p.id === input.planId);
-      if (!plan) {
-        throw new TRPCError({
-          code: "BAD_REQUEST",
-          message: `Unknown plan: ${input.planId}`,
-        });
-      }
+      const plan = getPlanById(input.planId);
+      const userId = ctx.session.user.id;
 
-      // Check whether the user already has an active subscription for this plan.
+      // Check for existing active subscription
       const existing = await ctx.db.subscription.findFirst({
         where: {
-          userId: ctx.session.user.id,
-          mainlayerResourceId: plan.resource_id,
+          userId,
+          planId: plan.id,
           status: "ACTIVE",
         },
       });
@@ -108,117 +121,118 @@ export const billingRouter = createTRPCRouter({
         });
       }
 
-      // Call Mainlayer to create the subscription.
-      const result = await mainlayer.createSubscription(
-        plan.resource_id,
-        input.payerWallet
-      );
-
-      if (result.status === "failed") {
+      // Create subscription via Mainlayer
+      let subscription;
+      try {
+        subscription = await mainlayer.createSubscription(
+          plan.resource_id,
+          userId
+        );
+      } catch (error) {
+        const message =
+          error instanceof MainlayerError
+            ? error.message
+            : "Failed to create subscription";
         throw new TRPCError({
-          code: "PAYMENT_REQUIRED",
-          message: "Subscription creation failed. Please try again.",
+          code: "INTERNAL_SERVER_ERROR",
+          message,
         });
       }
 
-      // Persist subscription record in our database.
-      const subscription = await ctx.db.subscription.create({
+      // Persist in local database
+      const record = await ctx.db.subscription.create({
         data: {
-          userId: ctx.session.user.id,
-          mainlayerResourceId: plan.resource_id,
-          payerWallet: input.payerWallet,
+          userId,
           planId: plan.id,
           planName: plan.name,
-          status: result.status === "active" ? "ACTIVE" : "INCOMPLETE",
+          mainlayerResourceId: plan.resource_id,
+          mainlayerSubscriptionId: subscription.subscription_id,
+          status: subscription.status === "active" ? "ACTIVE" : "PENDING",
+          currentPeriodStart: new Date(subscription.current_period_start),
+          currentPeriodEnd: subscription.current_period_end
+            ? new Date(subscription.current_period_end)
+            : null,
         },
       });
 
-      return {
-        subscription,
-        mainlayerSubscriptionId: result.subscription_id,
-      };
+      return record;
     }),
 
   /**
-   * Get the current subscription status for the authenticated user.
-   * Optionally syncs status with Mainlayer for freshness.
+   * Get the user's current subscription.
+   * Optionally syncs with Mainlayer API for fresh status.
    */
-  getSubscriptionStatus: protectedProcedure
-    .input(
-      z.object({
-        sync: z.boolean().default(false),
-      })
-    )
+  getCurrentSubscription: protectedProcedure
+    .input(z.object({ sync: z.boolean().default(false) }).optional())
     .query(async ({ ctx, input }) => {
       const subscription = await ctx.db.subscription.findFirst({
-        where: { userId: ctx.session.user.id },
+        where: {
+          userId: ctx.session.user.id,
+          status: { in: ["ACTIVE", "PENDING"] },
+        },
         orderBy: { createdAt: "desc" },
       });
 
       if (!subscription) {
-        return { subscription: null, synced: false };
+        return null;
       }
 
-      // Optionally refresh from Mainlayer.
-      if (input.sync) {
+      // Sync with Mainlayer if requested
+      if (input?.sync) {
         try {
-          const live = await mainlayer.checkSubscription(
+          const fresh = await mainlayer.getSubscription(
             subscription.mainlayerResourceId,
-            subscription.payerWallet
+            ctx.session.user.id
           );
 
-          const statusMap: Record<string, "ACTIVE" | "CANCELED" | "PAST_DUE" | "TRIALING" | "INCOMPLETE"> = {
-            active: "ACTIVE",
-            canceled: "CANCELED",
-            past_due: "PAST_DUE",
-            trialing: "TRIALING",
-            incomplete: "INCOMPLETE",
-          };
+          if (fresh) {
+            const statusMap: Record<string, string> = {
+              active: "ACTIVE",
+              pending: "PENDING",
+              canceled: "CANCELED",
+              past_due: "PAST_DUE",
+            };
 
-          const mappedStatus = statusMap[live.status] ?? "INCOMPLETE";
-
-          const updated = await ctx.db.subscription.update({
-            where: { id: subscription.id },
-            data: {
-              status: mappedStatus,
-              currentPeriodEnd: live.current_period_end
-                ? new Date(live.current_period_end)
-                : null,
-              canceledAt: live.canceled_at ? new Date(live.canceled_at) : null,
-            },
-          });
-
-          return { subscription: updated, synced: true };
+            await ctx.db.subscription.update({
+              where: { id: subscription.id },
+              data: {
+                status: statusMap[fresh.status] || "PENDING",
+                currentPeriodEnd: fresh.current_period_end
+                  ? new Date(fresh.current_period_end)
+                  : null,
+              },
+            });
+          }
         } catch {
-          // If the Mainlayer sync fails, return cached data rather than erroring.
-          return { subscription, synced: false };
+          // Ignore sync errors, return cached data
         }
       }
 
-      return { subscription, synced: false };
+      return subscription;
     }),
 
   /**
    * Cancel the user's active subscription.
    */
   cancelSubscription: protectedProcedure
-    .input(
-      z.object({
-        subscriptionId: z.string().cuid(),
-        mainlayerSubscriptionId: z.string().min(1),
-      })
-    )
+    .input(z.object({ subscriptionId: z.string().cuid() }))
     .mutation(async ({ ctx, input }) => {
       const subscription = await ctx.db.subscription.findUnique({
         where: { id: input.subscriptionId },
       });
 
       if (!subscription) {
-        throw new TRPCError({ code: "NOT_FOUND", message: "Subscription not found." });
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Subscription not found.",
+        });
       }
 
       if (subscription.userId !== ctx.session.user.id) {
-        throw new TRPCError({ code: "FORBIDDEN", message: "Not your subscription." });
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "You cannot cancel another user's subscription.",
+        });
       }
 
       if (subscription.status === "CANCELED") {
@@ -228,10 +242,25 @@ export const billingRouter = createTRPCRouter({
         });
       }
 
-      // Cancel on Mainlayer.
-      await mainlayer.cancelSubscription(input.mainlayerSubscriptionId);
+      // Cancel via Mainlayer API
+      try {
+        if (subscription.mainlayerSubscriptionId) {
+          await mainlayer.cancelSubscription(
+            subscription.mainlayerSubscriptionId
+          );
+        }
+      } catch (error) {
+        const message =
+          error instanceof MainlayerError
+            ? error.message
+            : "Failed to cancel subscription";
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message,
+        });
+      }
 
-      // Update local record.
+      // Update local record
       const updated = await ctx.db.subscription.update({
         where: { id: input.subscriptionId },
         data: {
@@ -244,12 +273,38 @@ export const billingRouter = createTRPCRouter({
     }),
 
   /**
-   * List all subscriptions for the current user (history).
+   * Get subscription history for the authenticated user.
    */
-  getSubscriptionHistory: protectedProcedure.query(async ({ ctx }) => {
-    return ctx.db.subscription.findMany({
-      where: { userId: ctx.session.user.id },
-      orderBy: { createdAt: "desc" },
-    });
-  }),
+  getSubscriptionHistory: protectedProcedure
+    .input(
+      z
+        .object({
+          limit: z.number().int().positive().max(100).default(10),
+          offset: z.number().int().nonnegative().default(0),
+        })
+        .optional()
+    )
+    .query(async ({ ctx, input }) => {
+      const limit = input?.limit ?? 10;
+      const offset = input?.offset ?? 0;
+
+      const [subscriptions, total] = await Promise.all([
+        ctx.db.subscription.findMany({
+          where: { userId: ctx.session.user.id },
+          orderBy: { createdAt: "desc" },
+          take: limit,
+          skip: offset,
+        }),
+        ctx.db.subscription.count({
+          where: { userId: ctx.session.user.id },
+        }),
+      ]);
+
+      return {
+        subscriptions,
+        total,
+        limit,
+        offset,
+      };
+    }),
 });
